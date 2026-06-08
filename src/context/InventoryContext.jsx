@@ -3,6 +3,9 @@ import { uid, randomColor, seedData } from '../lib/utils'
 import { nextFreeSlot, assignPositions, dropSlot, gravityPack, GRID, migratePositions } from '../lib/grid'
 
 const STORAGE_KEY = 'depo-inventario:v1'
+const API_URL = '/api/inventario' // función serverless en Vercel
+const POLL_MS = 8000 // cada cuánto refresca para ver cambios de otros
+const EDIT_PAUSE_MS = 15000 // tras editar, se pausa el refresco para no pisar cambios propios
 
 const InventoryContext = createContext(null)
 
@@ -12,6 +15,7 @@ export function useInventory() {
   return ctx
 }
 
+// Carga sincrónica desde localStorage (respaldo) para tener datos al instante.
 function loadInitial() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
@@ -27,20 +31,92 @@ function loadInitial() {
   return seedData()
 }
 
+// Contraseña de escritura opcional (si configurás WRITE_PASSWORD en Vercel).
+function writePassword() {
+  try {
+    return localStorage.getItem('depo-write-password') || ''
+  } catch {
+    return ''
+  }
+}
+
 export function InventoryProvider({ children }) {
   const [state, setState] = useState(loadInitial)
-  const firstRender = useRef(true)
+  const applyingRemote = useRef(false) // el cambio viene del servidor (no re-guardar)
+  const lastEditAt = useRef(0) // última edición local (para pausar el refresco)
+  const remoteSig = useRef('') // firma del último dato remoto aplicado
+  const saveTimer = useRef(null)
+  const firstSave = useRef(true)
 
-  // Persistencia en localStorage
+  // Aplica datos venidos del servidor (evita re-render si no cambió nada).
+  const applyRemote = useCallback((data) => {
+    const next = { shelves: migratePositions(data.shelves) }
+    const sig = JSON.stringify(next)
+    if (sig === remoteSig.current) return
+    remoteSig.current = sig
+    applyingRemote.current = true
+    setState(next)
+  }, [])
+
+  // Carga inicial desde el servidor (si la API está disponible)
   useEffect(() => {
-    if (firstRender.current) {
-      firstRender.current = false
+    let cancelled = false
+    fetch(API_URL)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('no api'))))
+      .then((d) => {
+        if (!cancelled && d && Array.isArray(d.shelves) && d.shelves.length) applyRemote(d)
+      })
+      .catch(() => {
+        /* sin backend (p. ej. dev local): se usa el respaldo de localStorage */
+      })
+    return () => {
+      cancelled = true
     }
+  }, [applyRemote])
+
+  // Refresco periódico: los invitados ven los cambios del admin sin recargar.
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (Date.now() - lastEditAt.current < EDIT_PAUSE_MS) return // hay edición reciente
+      fetch(API_URL)
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error('no api'))))
+        .then((d) => {
+          if (d && Array.isArray(d.shelves)) applyRemote(d)
+        })
+        .catch(() => {})
+    }, POLL_MS)
+    return () => clearInterval(id)
+  }, [applyRemote])
+
+  // Persistencia: localStorage siempre (cache) + servidor cuando es edición local.
+  useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
     } catch {
-      /* storage lleno o no disponible */
+      /* storage no disponible */
     }
+
+    if (firstSave.current) {
+      firstSave.current = false
+      remoteSig.current = JSON.stringify(state)
+      return // no guardar en el servidor en el primer render
+    }
+    if (applyingRemote.current) {
+      applyingRemote.current = false
+      return // el cambio vino del servidor, no reenviar
+    }
+
+    // Edición local -> guardar en el servidor (con debounce)
+    lastEditAt.current = Date.now()
+    remoteSig.current = JSON.stringify(state)
+    clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(() => {
+      fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-write-password': writePassword() },
+        body: JSON.stringify({ shelves: state.shelves }),
+      }).catch(() => {})
+    }, 500)
   }, [state])
 
   // ---------- Consultas ----------
